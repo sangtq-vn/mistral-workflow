@@ -1,0 +1,164 @@
+---
+version: '2.0'
+
+restore_new_instance_volume:
+  type: direct
+  description: Restore new instance volume
+
+  input:
+    - instance_id
+    - new_instance_name
+    - restore_backup_name
+
+  output:
+    executions: <% $.executions %>
+    execution: <% $.execution %>
+    flavor_id: <% $.flavor_id %>
+    networks_id_list: <% $.networks_id_list %>
+    userdata: <% $.userdata %>
+    restore_to_new_volumes_bootable: <% $.restore_to_new_volumes_bootable %>
+    block_devices_mapping_v2_bootable: <% $.block_devices_mapping_v2_bootable %>
+    restore_to_new_volumes_non_bootable: <% $.restore_to_new_volumes_non_bootable %>
+    block_devices_mapping_v2_non_bootable: <% $.block_devices_mapping_v2_non_bootable %>
+    block_devices_mapping_v2: <% $.block_devices_mapping_v2 %>
+    security_groups_list: <% $.security_groups_list %>
+    key_name: <% $.key_name %>
+    new_instance_id: <% $.new_instance_id %>
+    new_instance_status: <% $.new_instance_status %>
+
+  tasks:
+    check_restore_backup_name:
+      action: cinder.backups_findall name=<% [$.instance_id, $.restore_backup_name].join("-") %> status="available"
+      fail-on: <% task(check_restore_backup_name).result.id.len() = 0 %>
+      on-error:
+        - fail
+      on-success:
+        - workflow_executions
+
+    workflow_executions:
+      action: mistral.executions_find input=<% [ `{"instance_id":`, ` "`, $.instance_id, `", "backup_name":`, ` "` , $.restore_backup_name, `"}` ].join("") %>
+      publish:
+        executions: <% task(workflow_executions).result.where($.workflow_id =~ "be7bbc76-fde3-4b4c-b046-0fa7da1869ce" ) %>
+      on-success:
+        - execution
+
+    execution:
+      with-items: execution in <% $.executions.id %>
+      action: std.echo output=<% $.execution %>
+      publish:
+        execution: <% executions(id => task(execution).result[0], state => "SUCCESS")[0].toList()[2].toList()[1] %>
+      on-success:
+        - execution_rep
+
+    execution_rep:
+      action: std.echo output=<% $.execution %>
+      on-success:
+        - root_device_name
+
+    root_device_name:
+      action: std.echo output=<% task(execution_rep).result.instance['OS-EXT-SRV-ATTR:root_device_name'] %>
+      on-success:
+        - flavor_id
+
+    flavor_id:
+      action: nova.flavors_find name=<% $.execution.instance.flavor.original_name %>
+      publish:
+        flavor_id: <% task(flavor_id).result.id %>
+      on-complete:
+        - networks_id_list
+
+    networks_id_list:
+      publish:
+        networks_id_list: <% task(execution_rep).result.networks.select({'net-id' => $.net_id, 'fixed_ip' => $.fixed_ips[0].ip_address}) %>
+      on-complete:
+        - userdata
+
+    userdata:
+      publish:
+        userdata: <% task(execution_rep).result.instance['OS-EXT-SRV-ATTR:user_data'] %>
+      on-complete:
+        - backups_bootable
+
+    backups_bootable:
+      with-items: volume_instance_bootable in <% task(execution_rep).result.volumes_instance.where($.attachments[0].device = task(root_device_name).result).id %>
+      action: cinder.backups_find volume_id=<% $.volume_instance_bootable %> name=<% [$.instance_id, $.restore_backup_name].join("-") %>
+      on-success:
+        - restore_to_new_volumes_bootable
+
+    restore_to_new_volumes_bootable:
+      with-items: backup_bootable in <% task(backups_bootable).result %>
+      action: cinder.restores_restore backup_id=<% $.backup_bootable.id %> name=<% ["restore", $.backup_bootable.volume_id].join("_") %>
+      publish:
+        restore_to_new_volumes_bootable: <% task(restore_to_new_volumes_bootable).result %>
+      on-success:
+        - wait_for_restore_to_new_volumes_bootable
+
+    wait_for_restore_to_new_volumes_bootable:
+      with-items: restore_to_new_volume_bootable in <% $.restore_to_new_volumes_bootable %>
+      action: cinder.volumes_find id=<% $.restore_to_new_volume_bootable.volume_id %> status="available"
+      retry: count=120 delay=10
+      on-success:
+        - block_devices_mapping_v2_bootable
+
+    block_devices_mapping_v2_bootable:
+      publish:
+        block_devices_mapping_v2_bootable: <% task(wait_for_restore_to_new_volumes_bootable).result.select({"boot_index" => "0", "uuid" => $.id, "source_type" => "volume", "volume_size" => $.size, "destination_type" => "volume", "delete_on_termination" => "true"}) %>
+      on-success:
+        - backups_non_bootable
+
+    backups_non_bootable:
+      with-items: volume_instance_non_bootable in <% task(execution_rep).result.volumes_instance.where($.attachments[0].device != task(root_device_name).result).id %>
+      action: cinder.backups_find volume_id=<% $.volume_instance_non_bootable %> name=<% [$.instance_id, $.restore_backup_name].join("-") %>
+      on-success:
+        - restore_to_new_volumes_non_bootable
+
+    restore_to_new_volumes_non_bootable:
+      with-items: backup_non_bootable in <% task(backups_non_bootable).result %>
+      action: cinder.restores_restore backup_id=<% $.backup_non_bootable.id %> name=<% ["restore", $.backup_non_bootable.volume_id].join("_") %>
+      publish:
+        restore_to_new_volumes_non_bootable: <% task(restore_to_new_volumes_non_bootable).result %>
+      on-success:
+        - wait_for_restore_to_new_volumes_non_bootable
+
+    wait_for_restore_to_new_volumes_non_bootable:
+      with-items: restore_to_new_volume_non_bootable in <% $.restore_to_new_volumes_non_bootable %>
+      action: cinder.volumes_find id=<% $.restore_to_new_volume_non_bootable.volume_id %> status="available"
+      retry: count=120 delay=10
+      on-success:
+        - block_devices_mapping_v2_non_bootable
+
+    block_devices_mapping_v2_non_bootable:
+      publish:
+        block_devices_mapping_v2_non_bootable: <% task(wait_for_restore_to_new_volumes_non_bootable).result.select({"boot_index" => "-1", "uuid" => $.id, "source_type" => "volume", "volume_size" => $.size, "destination_type" => "volume", "delete_on_termination" => "true"}) %>
+      on-success:
+        - block_devices_mapping_v2
+
+    block_devices_mapping_v2:
+      publish:
+        block_devices_mapping_v2: <% $.block_devices_mapping_v2_bootable + $.block_devices_mapping_v2_non_bootable %>
+      on-success:
+        - security_groups_list
+
+    security_groups_list:
+      publish:
+        security_groups_list: <% $.execution.instance.security_groups.select($.name).distinct() %>
+      on-success:
+        - key_name
+
+    key_name:
+      publish:
+        key_name: <% $.execution.instance.key_name %>
+      on-success:
+        - create_new_instance_from_volume_restore
+
+    create_new_instance_from_volume_restore:
+      action: nova.servers_create name=<% $.new_instance_name %> image=null flavor=<% $.flavor_id %> security_groups=<% $.security_groups_list %> userdata=<% $.userdata %> key_name=<% $.key_name %> block_device_mapping_v2=<% $.block_devices_mapping_v2 %> nics=<% $.networks_id_list %>
+      publish:
+        new_instance_id: <% task(create_new_instance_from_volume_restore).result.id %>
+      on-success:
+        - wait_for_instance
+
+    wait_for_instance:
+      action: nova.servers_find id=<% $.new_instance_id %> status='ACTIVE'
+      retry: delay=120 count=10
+      publish:

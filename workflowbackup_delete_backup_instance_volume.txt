@@ -1,0 +1,39 @@
+---
+version: '2.0'
+
+delete_backup_instance_volume:
+  type: direct
+  description: Delete backup instance
+
+  input:
+    - instance_id
+    - backup_name
+
+  output:
+    backups: <% $.backups %>
+
+  tasks:
+    check_backup_name:
+      action: cinder.backups_findall
+      fail-on: <% set([$.instance_id, $.backup_name].join("-")).intersect(task(check_backup_name).result.name.distinct().toSet()).len() = 0 %>
+      on-success:
+        - backups
+
+    backups:
+      action: cinder.backups_findall name=<% [$.instance_id, $.backup_name].join("-") %> status="available"
+      publish:
+        backups: <% task(backups).result %>
+      on-success:
+        - delete_backups
+
+    delete_backups:
+      with-items: backup in <% $.backups %>
+      action: cinder.backups_delete backup=<% $.backup.id %>
+      on-success:
+        - wait_for_delete_backups
+
+    wait_for_delete_backups:
+      with-items: backup in <% $.backups %>
+      action: cinder.backups_find id=<% $.backup.id %>
+      on-error:
+        - succeed

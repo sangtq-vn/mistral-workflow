@@ -1,0 +1,256 @@
+---
+version: '2.0'
+
+restore_overwrite_instance_volume:
+  type: direct
+  description: Restore overwrite instance volume
+
+  input:
+    - instance_id
+    - restore_backup_name
+
+  output:
+    executions: <% $.executions %>
+    execution: <% $.execution %>
+    instance: <% $.instance %>
+    interfaces_detach_list: <% $.interfaces_detach_list %>
+    interfaces_attach_list: <% $.interfaces_attach_list %>
+#    key_name: <% $.key_name %>
+    volumes_instance: <% $.volumes_instance %>
+    backups: <% $.backups %>
+    volumes_backup: <% $.volumes_backup %>
+    volumes_intersect: <% $.volumes_intersect %>
+    volumes_instance_remove: <% $.volumes_instance_remove %>
+    volumes_instance_add: <% $.volumes_instance_add %>
+    backups_volumes_intersect: <% $.backups_volumes_intersect %>
+    backups_volumes_instance: <% $.backups_volumes_instance %>
+    restore_volumes_instance: <% $.restore_volumes_instance %>
+
+  tasks:
+    check_restore_backup_name:
+      action: cinder.backups_findall name=<% [$.instance_id, $.restore_backup_name].join("-") %> status="available"
+      fail-on: <% task(check_restore_backup_name).result.id.len() = 0 %>
+      on-error:
+        - fail
+      on-success:
+        - workflow_executions
+
+    workflow_executions:
+      action: mistral.executions_find input=<% [ `{"instance_id":`, ` "`, $.instance_id, `", "backup_name":`, ` "` , $.restore_backup_name, `"}` ].join("") %>
+      publish:
+        executions: <% task(workflow_executions).result.where($.workflow_id =~ "be7bbc76-fde3-4b4c-b046-0fa7da1869ce" ) %>
+      on-success:
+        - execution
+
+    execution:
+      with-items: execution in <% $.executions.id %>
+      action: std.echo output=<% $.execution %>
+      publish:
+        execution: <% executions(id => task(execution).result[0], state => "SUCCESS")[0].toList()[2].toList()[1] %>
+      on-success:
+        - execution_rep
+
+    execution_rep:
+      action: std.echo output=<% $.execution %>
+      on-success:
+        - instance
+
+    instance:
+      action: nova.servers_find id=<% $.instance_id %>
+      publish:
+        instance: <% task(instance).result %>
+      on-success:
+        - interfaces_detach_list
+
+    interfaces_detach_list:
+      action: nova.servers_interface_list server=<% $.instance_id %>
+      publish:
+        interfaces_detach_list: <% task(interfaces_detach_list).result %>
+      on-complete:
+        - interfaces_attach_list
+
+    interfaces_attach_list:
+      publish:
+        interfaces_attach_list: <% task(execution_rep).result.networks %>
+      on-complete:
+        - volumes_instance
+
+    volumes_instance:
+      with-items: volume_instance in <% $.instance['os-extended-volumes:volumes_attached'].select($.id) %>
+      action: cinder.volumes_find id=<% $.volume_instance %>
+      publish:
+        volumes_instance: <% task(volumes_instance).result %>
+      on-complete:
+        - backups
+
+    backups:
+      action: cinder.backups_findall name=<% [$.instance_id, $.restore_backup_name].join("-") %> status="available"
+      publish:
+        backups: <% task(backups).result %>
+      on-complete:
+        - volumes_backup
+
+    volumes_backup:
+      publish:
+        volumes_backup: <% $.backups.select($.volume_id) %>
+      on-complete:
+        - volumes_instance_intersect_volumes_backup
+
+    volumes_instance_intersect_volumes_backup:
+      publish:
+        volumes_intersect: <% $.volumes_instance.select($.id).toSet().intersect($.volumes_backup.toSet()) %>
+      on-complete:
+        - volumes_instance_remove
+
+    volumes_instance_remove:
+      publish:
+        volumes_instance_remove: <% $.volumes_instance.select($.id).toSet().difference($.volumes_intersect.toSet()) %>
+      on-success:
+        - volumes_instance_add
+
+    volumes_instance_add:
+      publish:
+        volumes_instance_add: <% $.backups.select($.volume_id).toSet().difference($.volumes_intersect.toSet()) %>
+      on-success:
+        - detach_volumes_instance
+
+    detach_volumes_instance:
+      with-items: volume_instance_remove in <% $.volumes_instance_remove %>
+      action: nova.volumes_delete_server_volume server_id=<% $.instance_id %> volume_id=<% $.volume_instance_remove %>
+      on-complete:
+        - wait_detach_volumes_instance
+
+    wait_detach_volumes_instance:
+      with-items: volume_instance_remove in <% $.volumes_instance_remove %>
+      action: cinder.volumes_find id=<% $.volume_instance_remove %> status="available"
+      retry: count=120 delay=10
+      on-complete:
+        - remove_volumes_instance
+
+    remove_volumes_instance:
+      with-items: volume_instance_remove in <% $.volumes_instance_remove %>
+      action: cinder.volumes_delete volume=<% $.volume_instance_remove %> cascade=true
+      on-error:
+        - unshelve_instance
+        - fail
+      on-complete:
+        - wait_for_remove_volumes_instance
+
+    wait_for_remove_volumes_instance:
+      with-items: volume_instance_remove in <% $.volumes_instance_remove %>
+      action: cinder.volumes_findall id=<% $.volume_instance_remove %>
+      on-complete:
+        - shelve_instance
+
+    shelve_instance:
+      action: nova.servers_shelve server=<% $.instance_id %>
+      on-error:
+        - unshelve_instance
+        - fail
+      on-complete:
+        - wait_for_shelve_instance
+
+    wait_for_shelve_instance:
+      action: nova.servers_find id=<% $.instance_id %> status="SHELVED_OFFLOADED"
+      retry: count=120 delay=10
+      on-complete:
+        - set_state_available_volumes_instance
+
+    set_state_available_volumes_instance:
+      with-items: volume_intersect in <% $.volumes_intersect %>
+      action: cinder.volumes_reset_state volume=<% $.volume_intersect %> state="available"
+      on-error:
+        - unshelve_instance
+      on-complete:
+        - wait_for_volumes_instance_available
+
+    wait_for_volumes_instance_available:
+      with-items: volume_intersect in <% $.volumes_intersect %>
+      action: cinder.volumes_find id=<% $.volume_intersect %> status="available"
+      retry: count=120 delay=10
+      on-success:
+        - backups_volumes_intersect
+
+    backups_volumes_intersect:
+      with-items: volume_intersect in <% $.volumes_intersect %>
+      action: cinder.backups_find volume_id=<% $.volume_intersect %> name=<% [$.instance_id, $.restore_backup_name].join("-") %> status="available"
+      publish:
+        backups_volumes_intersect: <% task(backups_volumes_intersect).result %>
+      on-error:
+        - unshelve_instance
+      on-success:
+        - restore_volumes_intersect
+
+    restore_volumes_intersect:
+      with-items: backup_volume_intersect in <% $.backups_volumes_intersect %>
+      action: cinder.restores_restore backup_id=<% $.backup_volume_intersect.id %> volume_id=<% $.backup_volume_intersect.volume_id %>
+      on-success:
+        - wait_restore_volumes_intersect
+
+    wait_restore_volumes_intersect:
+      with-items: backup_volume_intersect in <% $.backups_volumes_intersect %>
+      action: cinder.volumes_find id=<% $.backup_volume_intersect.volume_id %> status="available"
+      retry: count=120 delay=10
+      on-success:
+        - backups_volumes_instance
+
+    backups_volumes_instance:
+      with-items: volume_instance_add in <% $.volumes_instance_add %>
+      action: cinder.backups_find volume_id=<% $.volume_instance_add %> name=<% [$.instance_id, $.restore_backup_name].join("-") %> status="available"
+      publish:
+        backups_volumes_instance: <% task(backups_volumes_instance).result %>
+      on-error:
+        - unshelve_instance
+      on-success:
+        - restore_volumes_instance
+
+    restore_volumes_instance:
+      with-items: backup_volumes_instance in <% $.backups_volumes_instance %>
+      action: cinder.restores_restore backup_id=<% $.backup_volumes_instance.id %> name=<% ["restore", $.backup_volumes_instance.volume_id].join("_") %>
+      publish:
+        restore_volumes_instance: <% task(restore_volumes_instance).result %>
+      on-success:
+        - wait_for_restore_volumes_instance
+
+    wait_for_restore_volumes_instance:
+      with-items: restore_volume_instance in <% $.restore_volumes_instance %>
+      action: cinder.volumes_find id=<% $.restore_volume_instance.volume_id %> status="available"
+      retry: count=120 delay=10
+      on-success:
+        - attach_restore_volumes_instance
+
+    attach_restore_volumes_instance:
+      with-items: restore_volume_instance in <% $.restore_volumes_instance %>
+      action: nova.volumes_create_server_volume server_id=<% $.instance_id %> volume_id=<% $.restore_volume_instance.volume_id %> delete_on_termination=true
+      on-error:
+        - unshelve_instance
+        - fail
+      on-complete:
+        - unshelve_instance
+
+    unshelve_instance:
+      action: nova.servers_unshelve server=<% $.instance_id %>
+      on-success:
+        - wait_for_unshelve_instance
+
+    wait_for_unshelve_instance:
+      action: nova.servers_find id=<% $.instance_id %> status="ACTIVE"
+      retry: count=120 delay=10
+      on-success:
+        - instance_interfaces_detach
+
+    instance_interfaces_detach:
+      with-items: interface_detach_list in <% $.interfaces_detach_list %>
+      action: nova.servers_interface_detach server=<% $.instance_id %> port_id=<% $.interface_detach_list.port_id %>
+      on-success:
+        - instance_interfaces_attach
+
+    instance_interfaces_attach:
+      with-items: interface_attach_list in <% $.interfaces_attach_list %>
+      action: nova.servers_interface_attach server=<% $.instance_id %> port_id=null net_id=<% $.interface_attach_list.net_id %> fixed_ip=<% $.interface_attach_list.fixed_ips[0].ip_address %>
+      wait-before: 10
+      retry: count=0 delay=0 break-on=<% task(instance_interfaces_attach).result = 'Heartbeat wasn\'t received.' %>
+      on-error:
+        - succeed
+      on-complete:
+        - succeed

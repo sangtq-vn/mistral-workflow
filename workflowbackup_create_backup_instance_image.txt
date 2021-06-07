@@ -1,0 +1,30 @@
+---
+version: '2.0'
+
+create_backup_instance_image:
+  type: direct
+  description: Backup a server instance
+
+  input:
+    - instance_id
+    - backup_name
+    - rotation
+
+  output:
+    image_id: <% $.image_id %>
+    status:  <% $.status %>
+
+  tasks:
+    create_backup:
+      action: nova.servers_backup server=<% $.instance_id %> backup_name=<% $.backup_name %> backup_type="backup"  rotation=<% $.rotation %>
+      publish:
+        image_id: <% task().result.image_id %>
+      on-success:
+        - wait_for_backup
+
+    wait_for_backup:
+      action: glance.images_get image_id=<% $.image_id %>
+      fail-on: <% task().result.status != "active" %>
+      retry: count=120 delay=60
+      publish:
+        status: <% task().result.status %>

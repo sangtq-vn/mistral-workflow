@@ -1,0 +1,58 @@
+---
+version: '2.0'
+
+create_backup_instance_volume:
+  type: direct
+  description: Backup instance instance volume
+
+  input:
+    - instance_id
+    - backup_name
+
+  output:
+    instance: <% $.instance %>
+    volumes_instance: <% $.volumes_instance %>
+    backups: <% $.backups %>
+    networks: <% $.networks %>
+
+  tasks:
+    check_backup_name:
+      action: cinder.backups_findall
+      fail-on: <% [$.instance_id, $.backup_name].join("-") in task(check_backup_name).result.name.distinct() %>
+      on-success:
+        - instance
+
+    instance:
+      action: nova.servers_find id=<% $.instance_id %>
+      publish:
+        instance: <% task(instance).result %>
+      on-success:
+        - volumes_instance
+
+    volumes_instance:
+      with-items: volume_instance in <% $.instance['os-extended-volumes:volumes_attached'].select($.id) %>
+      action: cinder.volumes_find id=<% $.volume_instance %>
+      publish:
+        volumes_instance: <% task(volumes_instance).result %>
+      on-complete:
+        - backup_volumes_instance
+
+    backup_volumes_instance:
+      with-items: volume_instance in <% $.volumes_instance.select($.id) %>
+      action: cinder.backups_create volume_id=<% $.volume_instance %> name=<% [$.instance_id, $.backup_name].join("-") %> force="true"
+      publish:
+        backups: <% task(backup_volumes_instance).result %>
+      on-success:
+        - wait_for_backup_volumes_instance
+
+    wait_for_backup_volumes_instance:
+      with-items: backup in <% $.backups %>
+      action: cinder.backups_find id=<% $.backup.id %> status="available"
+      retry: count=120 delay=60
+      on-success:
+        - networks
+
+    networks:
+      action: nova.servers_interface_list server=<% $.instance_id %>
+      publish:
+        networks: <% task(networks).result %>
